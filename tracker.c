@@ -239,37 +239,62 @@ void handle_createtracker_req(int sock) {
     printf("created %s.track for %s:%d\n", tk_fname, tk_ip, tk_port);
 }
 
-
-// handles updatetracker - appends a new peer entry to the .track file
 // peers call this periodically to say "i still have bytes X to Y"
+// handles updatetracker - updates a peer's entry without duplicating
 void handle_updatetracker_req(int sock) {
     char filepath[512];
     snprintf(filepath, sizeof(filepath), "%s%s.track", torrent_dir, tk_fname);
-
     char resp[512];
 
     if (access(filepath, F_OK) != 0) {
         snprintf(resp, sizeof(resp), "<updatetracker %s ferr>\n", tk_fname);
         write(sock, resp, strlen(resp));
-        printf("updatetracker failed - no %s.track found\n", tk_fname);
         return;
     }
 
-    // just append for now - for the final demo we should check if this
-    // peer already has an entry and update it instead of duplicating
-    FILE *fp = fopen(filepath, "a");
+    FILE *fp = fopen(filepath, "r");
     if (!fp) {
         snprintf(resp, sizeof(resp), "<updatetracker %s fail>\n", tk_fname);
         write(sock, resp, strlen(resp));
         return;
     }
-    fprintf(fp, "%s:%d:%ld:%ld:%ld\n", tk_ip, tk_port, tk_start, tk_end, time(NULL));
+
+    // Read existing file into memory
+    char lines[1024][512];
+    int line_count = 0;
+    int found = 0;
+    
+    // Create a prefix to look for (e.g. "127.0.0.1:4002:")
+    char target_prefix[128];
+    snprintf(target_prefix, sizeof(target_prefix), "%s:%d:", tk_ip, tk_port);
+
+    while (fgets(lines[line_count], sizeof(lines[0]), fp)) {
+        if (strncmp(lines[line_count], target_prefix, strlen(target_prefix)) == 0) {
+            // Found the peer
+            snprintf(lines[line_count], sizeof(lines[0]), "%s:%d:%ld:%ld:%ld\n",
+                     tk_ip, tk_port, tk_start, tk_end, time(NULL));
+            found = 1;
+        }
+        line_count++;
+    }
+    fclose(fp);
+
+    // If peer wasn't in the file yet add them to the end
+    if (!found) {
+        snprintf(lines[line_count], sizeof(lines[0]), "%s:%d:%ld:%ld:%ld\n",
+                 tk_ip, tk_port, tk_start, tk_end, time(NULL));
+        line_count++;
+    }
+
+    // Write the cleaned-up list to the file
+    fp = fopen(filepath, "w");
+    for (int i = 0; i < line_count; i++) {
+        fputs(lines[i], fp);
+    }
     fclose(fp);
 
     snprintf(resp, sizeof(resp), "<updatetracker %s succ>\n", tk_fname);
     write(sock, resp, strlen(resp));
-    printf("updated %s.track - peer %s has bytes %ld to %ld\n",
-           tk_fname, tk_ip, tk_start, tk_end);
 }
 
 
@@ -280,7 +305,7 @@ void peer_handler(int sock) {
     if (length <= 0) return;
     read_msg[length] = '\0';
 
-    printf("got from peer: %s\n", read_msg);
+   // printf("got from peer: %s\n", read_msg);
 
     if (strstr(read_msg, "REQ LIST") || strstr(read_msg, "req list")) {
         handle_list_req(sock);
@@ -352,7 +377,7 @@ int main() {
             perror("accept failed"); continue;
         }
 
-        printf("connection from %s\n", inet_ntoa(client_addr.sin_addr));
+       // printf("connection from %s\n", inet_ntoa(client_addr.sin_addr));
 
         if ((pid = fork()) == 0) {
             // child - handle this peer then die

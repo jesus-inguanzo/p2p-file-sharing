@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -11,7 +12,7 @@
 #include <sys/stat.h>
 #include <limits.h>
 #define MAXLINE  2048
-#define BACKLOG  5
+#define BACKLOG  100
 #define CHUNK_BUFSIZE 1024
 
 struct ChunkTask {
@@ -196,6 +197,25 @@ void do_createtracker(const char *fname, long fsize, const char *desc,
     close(sock);
 }
 
+// doesn't print to the terminal
+void send_and_recv_quiet(int sock, const char *msg) {
+    if (write(sock, msg, strlen(msg)) < 0) return;
+
+    char buf[MAXLINE];
+    int done = 0;
+
+    while (!done) {
+        int n = read(sock, buf, MAXLINE - 1);
+        if (n <= 0) break;
+        buf[n] = '\0';
+
+        if (strstr(buf, "END")  || strstr(buf, "succ") ||
+            strstr(buf, "fail") || strstr(buf, "ferr") ||
+            strstr(buf, "invalid")) {
+            done = 1;
+        }
+    }
+}
 
 void do_updatetracker(const char *fname, long start_b, long end_b,
                       const char *ip, int port) {
@@ -207,10 +227,8 @@ void do_updatetracker(const char *fname, long start_b, long end_b,
              "<updatetracker %s %ld %ld %s %d>\n",
              fname, start_b, end_b, ip, port);
 
-    printf("\n--- %s", msg);
-    send_and_recv(sock, msg, NULL, 0);
-    printf("---\n\n");
-
+    // quiet sender so it doesn't spam the terminal
+    send_and_recv_quiet(sock, msg);
     close(sock);
 }
 
@@ -221,8 +239,27 @@ void *update_thread_func(void *arg) {
     (void)arg;
     while (1) {
         sleep(update_interval);
-        // TODO before final: scan shared_dir and send one update per file
-       // do_updatetracker("demo", 0, 0, tracker_ip, my_listen_port);
+        
+        DIR *d = opendir(shared_dir);
+        if (d) {
+            struct dirent *dir;
+            while ((dir = readdir(d)) != NULL) {
+                // Only look at regular files
+                if (dir->d_type == DT_REG && !strstr(dir->d_name, ".track") && dir->d_name[0] != '.') {
+                    
+                    char filepath[512];
+                    snprintf(filepath, sizeof(filepath), "%s%s", shared_dir, dir->d_name);
+                    
+                    // Get the current size of the file
+                    struct stat st;
+                    if (stat(filepath, &st) == 0 && st.st_size > 0) {
+                        // Tell tracker we have bytes 0 through current size
+                        do_updatetracker(dir->d_name, 0, st.st_size - 1, "127.0.0.1", my_listen_port);
+                    }
+                }
+            }
+            closedir(d);
+        }
     }
     return NULL;
 }
@@ -269,10 +306,10 @@ static int recv_line(int sock, char *buf, size_t size) {
 
         buf[i++] = c;
         
-        if (c == '\n') break; // stop at newline
+        if (c == '\n') break; 
     }
 
-    buf[i] = '\0'; // null terminate
+    buf[i] = '\0';
     return (int)i;
 }
 
@@ -295,7 +332,7 @@ static int send_error_msg(int sock, const char *msg) {
     return send_all(sock, line, strlen(line));
 }
 
-//core logic: send requested byte range from file
+//send requested byte range from file
 static int handle_getchunk_request(int conn, const char *filename, long start_b, long end_b) {
     char filepath[512];
     FILE *fp = NULL;
@@ -512,81 +549,103 @@ void get_cross_platform_md5(const char *filepath, char *result_hash) {
 // Thread that tries peers until one answers
 void *download_chunk_thread(void *arg) {
     struct ChunkTask *task = (struct ChunkTask *)arg;
-    
-    int sock = -1;
     int connected = 0;
-    int curr_idx = task->start_idx;
     
-    // --- RETRY LOGIC: Cycle through peers if one is offline ---
-    for (int tries = 0; tries < task->num_sources; tries++) {
-        sock = socket(AF_INET, SOCK_STREAM, 0);
-        struct sockaddr_in peer_addr;
-        peer_addr.sin_family = AF_INET;
-        peer_addr.sin_port = htons(task->ports[curr_idx]);
-        peer_addr.sin_addr.s_addr = inet_addr(task->ips[curr_idx]);
-
-        if (connect(sock, (struct sockaddr *)&peer_addr, sizeof(peer_addr)) == 0) {
-            connected = 1;
-            break; // Success!
-        }
-        close(sock);
-        // Move to the next peer in the list
-        curr_idx = (curr_idx + 1) % task->num_sources;
-    }
-
-    if (!connected) {
-        printf("ERROR: All peers offline for chunk %ld\n", task->start_byte);
-        free(task);
-        return NULL;
-    }
-
-    // Ask for chunk using the successful socket
-    char req[256];
-    sprintf(req, "GETCHUNK %s %ld %ld\n", task->filename, task->start_byte, task->end_byte);
-    write(sock, req, strlen(req));
-
-    // Read response
-    char buffer[2048];
-    int bytes_read = read(sock, buffer, sizeof(buffer) - 1);
-    
-    if (bytes_read > 0) {
-        buffer[bytes_read] = '\0';
-        char *data = strchr(buffer, '\n');
+    // Loop infinitely until chunk is successfully downloaded
+    while (!connected) {
+        int sock = -1;
+        int curr_idx = task->start_idx;
         
-        if (data) {
-            data++;
-            int header_size = data - buffer;
-            int data_bytes = bytes_read - header_size;
+        for (int tries = 0; tries < task->num_sources; tries++) {
+            sock = socket(AF_INET, SOCK_STREAM, 0);
+            struct sockaddr_in peer_addr;
+            peer_addr.sin_family = AF_INET;
+            peer_addr.sin_port = htons(task->ports[curr_idx]);
+            peer_addr.sin_addr.s_addr = inet_addr(task->ips[curr_idx]);
 
+            if (connect(sock, (struct sockaddr *)&peer_addr, sizeof(peer_addr)) == 0) {
+                connected = 1;
+                break;
+            }
+            close(sock);
+            curr_idx = (curr_idx + 1) % task->num_sources;
+        }
+
+        if (!connected) {
+            // Wait 2 seconds for other peers to update the tracker
+            sleep(2);
+            
+            // Re-read the local .track file to see if new peers appeared
             char filepath[512];
-            sprintf(filepath, "%s%s", shared_dir, task->filename);
-            
-            FILE *fp = fopen(filepath, "r+");
-            if (!fp) fp = fopen(filepath, "w");
-            
+            sprintf(filepath, "%s%s.track", shared_dir, task->filename);
+            FILE *fp = fopen(filepath, "r");
             if (fp) {
-                fseek(fp, task->start_byte, SEEK_SET);
-                fwrite(data, 1, data_bytes, fp);
-                
-                int needed = (task->end_byte - task->start_byte + 1) - data_bytes;
-                while (needed > 0) {
-                    int n = read(sock, buffer, sizeof(buffer));
-                    if (n <= 0) break;
-                    fwrite(buffer, 1, n, fp);
-                    needed -= n;
+                task->num_sources = 0;
+                char line[512];
+                while (fgets(line, sizeof(line), fp)) {
+                    if (line[0] != '#' && strstr(line, ":") && task->num_sources < 30) {
+                        if (sscanf(line, "%[^:]:%d", task->ips[task->num_sources], &task->ports[task->num_sources]) == 2) {
+                            task->num_sources++;
+                        }
+                    }
                 }
                 fclose(fp);
             }
+            continue; // Go back to the top of the while loop and try the new list
         }
+
+        // Ask for chunk using successful socket
+        char req[256];
+        sprintf(req, "GETCHUNK %s %ld %ld\n", task->filename, task->start_byte, task->end_byte);
+        write(sock, req, strlen(req));
+
+        char buffer[2048];
+        int bytes_read = read(sock, buffer, sizeof(buffer) - 1);
+        
+        if (bytes_read > 0) {
+            buffer[bytes_read] = '\0';
+            char *data = strchr(buffer, '\n');
+            
+            if (data) {
+                data++;
+                int header_size = data - buffer;
+                int data_bytes = bytes_read - header_size;
+
+                char filepath[512];
+                sprintf(filepath, "%s%s", shared_dir, task->filename);
+                
+                FILE *fp = fopen(filepath, "r+");
+                if (!fp) fp = fopen(filepath, "w");
+                
+                if (fp) {
+                    fseek(fp, task->start_byte, SEEK_SET);
+                    fwrite(data, 1, data_bytes, fp);
+                    
+                    int needed = (task->end_byte - task->start_byte + 1) - data_bytes;
+                    while (needed > 0) {
+                        int n = read(sock, buffer, sizeof(buffer));
+                        if (n <= 0) break;
+                        fwrite(buffer, 1, n, fp);
+                        needed -= n;
+                    }
+                    fclose(fp);
+                }
+            }
+        } else {
+            // Socket connected but read failed (peer died mid-transfer)
+            close(sock);
+            connected = 0; // Force loop to restart and find a new peer
+            continue;
+        }
+        
+        int my_peer = my_listen_port - 4000;
+        printf("Peer%d downloading %ld to %ld bytes of %s from %s %d\n",
+               my_peer, task->start_byte, task->end_byte, task->filename,
+               task->ips[curr_idx], task->ports[curr_idx]);
+               
+        close(sock);
     }
     
-    int my_peer = my_listen_port - 4000;
-    printf("Peer%d downloading %ld to %ld bytes of %s from %s %d\n",
-           my_peer, task->start_byte, task->end_byte, task->filename,
-           task->ips[curr_idx], task->ports[curr_idx]);
-           
-    usleep(10000);
-    close(sock);
     free(task);
     return NULL;
 }
@@ -659,7 +718,7 @@ void start_multithreaded_download(char *trackfile_name) {
         if (task->end_byte >= filesize) task->end_byte = filesize - 1;
 
         pthread_create(&threads[i], NULL, download_chunk_thread, task);
-        usleep(10000); // 10ms delay so we don't crash the network stack
+        usleep(1000); // 1ms delay so we don't crash the network stack
     }
 
     // wait for all chunks to finish
