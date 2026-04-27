@@ -178,6 +178,47 @@ void handle_list_req(int sock) {
 }
 
 
+
+// computes MD5 of a file's contents using whichever tool is on the system
+// writes a 32-char hex string into 'out', or "?" on failure
+static void compute_file_md5(const char *path, char *out, size_t out_size) {
+    if (out_size < 2) return;
+    strcpy(out, "?");
+
+    char cmd[600];
+    FILE *p;
+
+    // try linux md5sum first
+    snprintf(cmd, sizeof(cmd), "md5sum '%s' 2>/dev/null", path);
+    p = popen(cmd, "r");
+    if (p) {
+        char hash[64] = {0};
+        if (fscanf(p, "%63s", hash) == 1 && strlen(hash) == 32) {
+            pclose(p);
+            strncpy(out, hash, out_size - 1);
+            out[out_size - 1] = '\0';
+            return;
+        }
+        pclose(p);
+    }
+
+    // fall back to macOS md5
+    snprintf(cmd, sizeof(cmd), "md5 -q '%s' 2>/dev/null", path);
+    p = popen(cmd, "r");
+    if (p) {
+        char hash[64] = {0};
+        if (fscanf(p, "%63s", hash) == 1 && strlen(hash) == 32) {
+            pclose(p);
+            strncpy(out, hash, out_size - 1);
+            out[out_size - 1] = '\0';
+            return;
+        }
+        pclose(p);
+    }
+}
+
+
+
 // handles GET - just streams the .track file back to whoever asked
 void handle_get_req(int sock, char *filename) {
     filename[strcspn(filename, " \t\r\n")] = '\0';
@@ -200,8 +241,17 @@ void handle_get_req(int sock, char *filename) {
     fclose(fp);
 
     // TODO: compute actual md5 of the tracker file content before final demo
-    write(sock, "<REP GET END placeholder_md5>\n", 30);
-    printf("sent %s to peer\n", filename);
+    // write(sock, "<REP GET END placeholder_md5>\n", 30);
+    // printf("sent %s to peer\n", filename);
+
+    // compute real MD5 of the tracker file content
+    char track_md5[64];
+    compute_file_md5(filepath, track_md5, sizeof(track_md5));
+
+    char trailer[128];
+    snprintf(trailer, sizeof(trailer), "<REP GET END %s>\n", track_md5);
+    write(sock, trailer, strlen(trailer));
+    printf("sent %s to peer (md5=%s)\n", filename, track_md5);
 }
 
 
@@ -378,7 +428,6 @@ int main() {
         }
 
        // printf("connection from %s\n", inet_ntoa(client_addr.sin_addr));
-
         if ((pid = fork()) == 0) {
             // child - handle this peer then die
             close(sockid);
