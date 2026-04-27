@@ -353,26 +353,45 @@ void handle_updatetracker_req(int sock) {
     char lines[1024][512];
     int line_count = 0;
     int found = 0;
+    long current_time = time(NULL);
     
     // Create a prefix to look for (e.g. "127.0.0.1:4002:")
     char target_prefix[128];
     snprintf(target_prefix, sizeof(target_prefix), "%s:%d:", tk_ip, tk_port);
 
     while (fgets(lines[line_count], sizeof(lines[0]), fp)) {
-        if (strncmp(lines[line_count], target_prefix, strlen(target_prefix)) == 0) {
-            // Found the peer
-            snprintf(lines[line_count], sizeof(lines[0]), "%s:%d:%ld:%ld:%ld\n",
-                     tk_ip, tk_port, tk_start, tk_end, time(NULL));
-            found = 1;
+        // 1. Skip headers so they don't get deleted
+        if (lines[line_count][0] == '#' || strstr(lines[line_count], "Filename:") ||
+            strstr(lines[line_count], "Filesize:") || strstr(lines[line_count], "Description:") ||
+            strstr(lines[line_count], "MD5:")) {
+            line_count++;
+            continue;
         }
-        line_count++;
+
+        // 2. Update the active peer
+        if (strncmp(lines[line_count], target_prefix, strlen(target_prefix)) == 0) {
+            snprintf(lines[line_count], sizeof(lines[0]), "%s:%d:%ld:%ld:%ld\n",
+                     tk_ip, tk_port, tk_start, tk_end, current_time);
+            found = 1;
+            line_count++;
+        } else {
+            // 3. Prune dead peers (older than 40s)
+            char p_ip[64]; int p_port; long p_start, p_end, p_time;
+            if (sscanf(lines[line_count], "%[^:]:%d:%ld:%ld:%ld", p_ip, &p_port, &p_start, &p_end, &p_time) == 5) {
+                if (current_time - p_time <= 40) {
+                    line_count++;
+                }
+            } else {
+                line_count++;
+            }
+        }
     }
     fclose(fp);
 
     // If peer wasn't in the file yet add them to the end
     if (!found) {
         snprintf(lines[line_count], sizeof(lines[0]), "%s:%d:%ld:%ld:%ld\n",
-                 tk_ip, tk_port, tk_start, tk_end, time(NULL));
+                 tk_ip, tk_port, tk_start, tk_end, current_time);
         line_count++;
     }
 
