@@ -15,6 +15,7 @@
 
 #define MAXLINE  2048
 #define BACKLOG  10
+#define DEAD_PEER_TIMEOUT_SEC 30
 
 // globals - filled in from sconfig at startup
 int  server_port = 3490;
@@ -37,6 +38,41 @@ char tk_ip[64];
 int  tk_port;
 long tk_start;
 long tk_end;
+
+// removes stale peer entries from a .track file
+// peer lines are expected as: ip:port:start:end:timestamp
+static void prune_stale_peers_in_track(const char *filepath) {
+    FILE *fp = fopen(filepath, "r");
+    if (!fp) return;
+
+    char lines[2048][512];
+    int line_count = 0;
+    time_t now = time(NULL);
+
+    while (line_count < 2048 && fgets(lines[line_count], sizeof(lines[0]), fp)) {
+        char ip[64];
+        int port;
+        long start_b, end_b, ts;
+
+        // keep non-peer metadata lines as-is
+        if (sscanf(lines[line_count], "%63[^:]:%d:%ld:%ld:%ld",
+                   ip, &port, &start_b, &end_b, &ts) == 5) {
+            if ((now - ts) <= DEAD_PEER_TIMEOUT_SEC) {
+                line_count++;
+            }
+        } else {
+            line_count++;
+        }
+    }
+    fclose(fp);
+
+    fp = fopen(filepath, "w");
+    if (!fp) return;
+    for (int i = 0; i < line_count; i++) {
+        fputs(lines[i], fp);
+    }
+    fclose(fp);
+}
 
 
 // called when a child process finishes so it doesnt become a zombie
@@ -152,6 +188,7 @@ void handle_list_req(int sock) {
     for (int i = 0; i < count; i++) {
         char filepath[512];
         snprintf(filepath, sizeof(filepath), "%s%s", torrent_dir, files[i]);
+        prune_stale_peers_in_track(filepath);
 
         // open each .track file and pull out the fields we need
         FILE *fp = fopen(filepath, "r");
@@ -225,6 +262,7 @@ void handle_get_req(int sock, char *filename) {
 
     char filepath[512];
     snprintf(filepath, sizeof(filepath), "%s%s", torrent_dir, filename);
+    prune_stale_peers_in_track(filepath);
 
     FILE *fp = fopen(filepath, "r");
     if (!fp) {
@@ -301,6 +339,8 @@ void handle_updatetracker_req(int sock) {
         write(sock, resp, strlen(resp));
         return;
     }
+
+    prune_stale_peers_in_track(filepath);
 
     FILE *fp = fopen(filepath, "r");
     if (!fp) {
