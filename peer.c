@@ -3,6 +3,7 @@
 #include <string.h>
 #include <dirent.h>
 #include <unistd.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
