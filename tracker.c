@@ -12,6 +12,8 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <errno.h>
+#include <sys/file.h>
+#include <fcntl.h>
 
 #define MAXLINE  2048
 #define BACKLOG  10
@@ -42,8 +44,19 @@ long tk_end;
 // removes stale peer entries from a .track file
 // peer lines are expected as: ip:port:start:end:timestamp
 static void prune_stale_peers_in_track(const char *filepath) {
-    FILE *fp = fopen(filepath, "r");
-    if (!fp) return;
+    int fd = open(filepath, O_RDWR);
+    if (fd < 0) return;
+    if (flock(fd, LOCK_EX) != 0) {
+        close(fd);
+        return;
+    }
+
+    FILE *fp = fdopen(fd, "r+");
+    if (!fp) {
+        flock(fd, LOCK_UN);
+        close(fd);
+        return;
+    }
 
     char lines[2048][512];
     int line_count = 0;
@@ -64,13 +77,17 @@ static void prune_stale_peers_in_track(const char *filepath) {
             line_count++;
         }
     }
-    fclose(fp);
-
-    fp = fopen(filepath, "w");
-    if (!fp) return;
+    rewind(fp);
+    if (ftruncate(fd, 0) != 0) {
+        flock(fd, LOCK_UN);
+        fclose(fp);
+        return;
+    }
     for (int i = 0; i < line_count; i++) {
         fputs(lines[i], fp);
     }
+    fflush(fp);
+    flock(fd, LOCK_UN);
     fclose(fp);
 }
 
@@ -191,7 +208,19 @@ void handle_list_req(int sock) {
         prune_stale_peers_in_track(filepath);
 
         // open each .track file and pull out the fields we need
-        FILE *fp = fopen(filepath, "r");
+        int fd = open(filepath, O_RDONLY);
+        FILE *fp = NULL;
+        if (fd >= 0) {
+            if (flock(fd, LOCK_SH) == 0) {
+                fp = fdopen(fd, "r");
+                if (!fp) {
+                    flock(fd, LOCK_UN);
+                    close(fd);
+                }
+            } else {
+                close(fd);
+            }
+        }
         char fname[256] = "?";
         char fsize[64]  = "0";
         char md5[64]    = "?";
@@ -204,7 +233,10 @@ void handle_list_req(int sock) {
             else if (strncmp(line, "MD5:", 4) == 0)
                 sscanf(line, "MD5: %63s", md5);
         }
-        if (fp) fclose(fp);
+        if (fp) {
+            flock(fileno(fp), LOCK_UN);
+            fclose(fp);
+        }
 
         snprintf(buf, sizeof(buf), "<%d %s %s %s>\n", i+1, fname, fsize, md5);
         write(sock, buf, strlen(buf));
@@ -264,8 +296,18 @@ void handle_get_req(int sock, char *filename) {
     snprintf(filepath, sizeof(filepath), "%s%s", torrent_dir, filename);
     prune_stale_peers_in_track(filepath);
 
-    FILE *fp = fopen(filepath, "r");
+    int fd = open(filepath, O_RDONLY);
+    if (fd < 0 || flock(fd, LOCK_SH) != 0) {
+        if (fd >= 0) close(fd);
+        printf("GET failed - %s doesnt exist\n", filepath);
+        write(sock, "<GET invalid>\n", 14);
+        return;
+    }
+
+    FILE *fp = fdopen(fd, "r");
     if (!fp) {
+        flock(fd, LOCK_UN);
+        close(fd);
         printf("GET failed - %s doesnt exist\n", filepath);
         write(sock, "<GET invalid>\n", 14);
         return;
@@ -276,6 +318,7 @@ void handle_get_req(int sock, char *filename) {
     char buf[MAXLINE];
     while (fgets(buf, sizeof(buf), fp))
         write(sock, buf, strlen(buf));
+    flock(fd, LOCK_UN);
     fclose(fp);
 
     // TODO: compute actual md5 of the tracker file content before final demo
@@ -298,18 +341,29 @@ void handle_get_req(int sock, char *filename) {
 void handle_createtracker_req(int sock) {
     char filepath[512];
     snprintf(filepath, sizeof(filepath), "%s%s.track", torrent_dir, tk_fname);
-
-    if (access(filepath, F_OK) == 0) {
-        // already exists, tell the peer
-        write(sock, "<createtracker ferr>\n", 21);
-        printf("createtracker rejected - %s.track already exists\n", tk_fname);
-        return;
-    }
-
     mkdir(torrent_dir, 0755);
 
-    FILE *fp = fopen(filepath, "w");
+    int fd = open(filepath, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) {
+        if (errno == EEXIST) {
+            write(sock, "<createtracker ferr>\n", 21);
+            printf("createtracker rejected - %s.track already exists\n", tk_fname);
+            return;
+        }
+        write(sock, "<createtracker fail>\n", 21);
+        printf("createtracker failed - couldnt write to %s\n", filepath);
+        return;
+    }
+    if (flock(fd, LOCK_EX) != 0) {
+        close(fd);
+        write(sock, "<createtracker fail>\n", 21);
+        printf("createtracker failed - couldnt lock %s\n", filepath);
+        return;
+    }
+    FILE *fp = fdopen(fd, "w");
     if (!fp) {
+        flock(fd, LOCK_UN);
+        close(fd);
         write(sock, "<createtracker fail>\n", 21);
         printf("createtracker failed - couldnt write to %s\n", filepath);
         return;
@@ -321,6 +375,8 @@ void handle_createtracker_req(int sock) {
     fprintf(fp, "MD5: %s\n",         tk_md5);
     fprintf(fp, "# ip:port:start:end:timestamp\n");
     fprintf(fp, "%s:%d:0:%s:%ld\n",  tk_ip, tk_port, tk_fsize, time(NULL));
+    fflush(fp);
+    flock(fd, LOCK_UN);
     fclose(fp);
 
     write(sock, "<createtracker succ>\n", 21);
@@ -342,8 +398,23 @@ void handle_updatetracker_req(int sock) {
 
     prune_stale_peers_in_track(filepath);
 
-    FILE *fp = fopen(filepath, "r");
+    int fd = open(filepath, O_RDWR);
+    if (fd < 0) {
+        snprintf(resp, sizeof(resp), "<updatetracker %s fail>\n", tk_fname);
+        write(sock, resp, strlen(resp));
+        return;
+    }
+    if (flock(fd, LOCK_EX) != 0) {
+        close(fd);
+        snprintf(resp, sizeof(resp), "<updatetracker %s fail>\n", tk_fname);
+        write(sock, resp, strlen(resp));
+        return;
+    }
+
+    FILE *fp = fdopen(fd, "r+");
     if (!fp) {
+        flock(fd, LOCK_UN);
+        close(fd);
         snprintf(resp, sizeof(resp), "<updatetracker %s fail>\n", tk_fname);
         write(sock, resp, strlen(resp));
         return;
@@ -386,7 +457,14 @@ void handle_updatetracker_req(int sock) {
             }
         }
     }
-    fclose(fp);
+    rewind(fp);
+    if (ftruncate(fd, 0) != 0) {
+        flock(fd, LOCK_UN);
+        fclose(fp);
+        snprintf(resp, sizeof(resp), "<updatetracker %s fail>\n", tk_fname);
+        write(sock, resp, strlen(resp));
+        return;
+    }
 
     // If peer wasn't in the file yet add them to the end
     if (!found) {
@@ -396,10 +474,11 @@ void handle_updatetracker_req(int sock) {
     }
 
     // Write the cleaned-up list to the file
-    fp = fopen(filepath, "w");
     for (int i = 0; i < line_count; i++) {
         fputs(lines[i], fp);
     }
+    fflush(fp);
+    flock(fd, LOCK_UN);
     fclose(fp);
 
     snprintf(resp, sizeof(resp), "<updatetracker %s succ>\n", tk_fname);
